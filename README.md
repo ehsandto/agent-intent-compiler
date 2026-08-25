@@ -7,3 +7,7 @@ Validators independently fetch the intent and plan documents, verify both hashes
 Only a `COMPILED` plan at the current activation head opens `verify_execution_ready`. Unavailable sources and revision failures are stored and cannot preserve a stale positive gate.
 
 Run `genvm-lint check contracts/AgentIntentCompiler.py` and `npm test`.
+
+## Live deployment
+
+StudioNet contract: [`0x9EeA...aEEa`](https://explorer-studio.genlayer.com/address/0x9EeAb863f22c7354F862EdC7f31a8094F088aEEa). See [LIVE_PROOFS.md](LIVE_PROOFS.md) for the authenticated compilation proof and exact deployed-source verification.
