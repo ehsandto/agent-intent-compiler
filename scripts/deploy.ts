@@ -1,0 +1,5 @@
+import fs from"node:fs";
+import{createAccount,createClient}from"genlayer-js";
+import{studionet}from"genlayer-js/chains";
+import{TransactionStatus}from"genlayer-js/types";
+const account=createAccount(),client=createClient({chain:studionet,account}),code=fs.readFileSync("contracts/AgentIntentCompiler.py","utf8"),hash=await client.deployContract({account,code,args:[]});console.log(`deploymentTransaction=${hash}`);const r:any=await client.waitForTransactionReceipt({hash:hash as never,status:TransactionStatus.FINALIZED,interval:5000,retries:180}),address=r.data?.contract_address??r.txDataDecoded?.contractAddress,fatal=(r.consensus_data?.leader_receipt??[]).filter((x:any)=>x.execution_result!=="SUCCESS"&&x.genvm_result?.error_code!=="CONSENSUS_VALIDATOR_QUORUM_REACHED");if(!address||r.result_name!=="MAJORITY_AGREE"||fatal.length)throw Error(JSON.stringify({address,result:r.result_name,fatal}));fs.writeFileSync("deployment.json",JSON.stringify({address,hash},null,2));console.log(JSON.stringify({address,hash,status:r.status_name,consensus:r.result_name},null,2));
