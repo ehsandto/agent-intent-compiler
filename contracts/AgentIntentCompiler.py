@@ -6,7 +6,7 @@ import json
 
 MAX_BODY=24000
 MAX_STEPS=20
-POLICY="agent-intent-compiler-v1-exact-vector"
+POLICY="agent-intent-compiler-v2-retry-safe-exact-vector"
 
 @allow_storage
 @dataclass
@@ -36,6 +36,8 @@ class Plan:
     state: str
     report_json: str
     fingerprint: str
+    replacement_of: str
+    attempt: u64
 
 class AgentIntentCompiler(gl.Contract):
     intents: TreeMap[str,Intent]
@@ -43,6 +45,9 @@ class AgentIntentCompiler(gl.Contract):
     plans: TreeMap[str,Plan]
     plan_exists: TreeMap[str,bool]
     version_reserved: TreeMap[str,bool]
+    latest_attempt: TreeMap[str,str]
+    attempt_count: TreeMap[str,u64]
+    version_finalized: TreeMap[str,bool]
 
     def __init__(self)->None: pass
 
@@ -71,29 +76,58 @@ class AgentIntentCompiler(gl.Contract):
         expected=int(item.reserved_version)+1
         if int(version)!=expected: raise gl.vm.UserError("EXPECTED: next version required")
         parent=parent_plan.strip()
-        if (expected==1 and len(parent)>0) or (expected>1 and parent!=item.latest_plan): raise gl.vm.UserError("EXPECTED: invalid parent")
+        if parent!=item.active_plan: raise gl.vm.UserError("EXPECTED: invalid parent")
         slot=iid+":"+str(expected)
-        if self.version_reserved.get(slot,False): raise gl.vm.UserError("EXPECTED: version reserved")
-        self.plans[pid]=Plan(iid,version,parent,gl.message.sender_address,self._url(plan_url),self._hash(plan_hash),"SUBMITTED","",""); self.plan_exists[pid]=True; self.version_reserved[slot]=True
-        item.reserved_version=version; item.latest_plan=pid; item.state="PLAN_SUBMITTED"; self.intents[iid]=item
+        if self.version_finalized.get(slot,False): raise gl.vm.UserError("EXPECTED: version finalized")
+        replacement=""; attempt=u64(1)
+        if self.version_reserved.get(slot,False):
+            replacement=self.latest_attempt.get(slot,"")
+            if len(replacement)==0: raise gl.vm.UserError("EXPECTED: missing prior attempt")
+            prior=self._plan(replacement)
+            if prior.state not in ("REQUIRES_REVISION","UNAVAILABLE","ABANDONED","STALE"): raise gl.vm.UserError("EXPECTED: prior attempt not retryable")
+            if prior.parent_plan!=parent: raise gl.vm.UserError("EXPECTED: replacement parent changed")
+            attempt=u64(int(self.attempt_count.get(slot,u64(0)))+1)
+        self.plans[pid]=Plan(iid,version,parent,gl.message.sender_address,self._url(plan_url),self._hash(plan_hash),"SUBMITTED","","",replacement,attempt); self.plan_exists[pid]=True; self.version_reserved[slot]=True
+        self.latest_attempt[slot]=pid; self.attempt_count[slot]=attempt
+        item.latest_plan=pid; item.state="PLAN_SUBMITTED"; self.intents[iid]=item
+
+    @gl.public.write
+    def abandon_plan(self,plan_id:str)->None:
+        pid=self._id(plan_id); plan=self._plan(pid); intent=self._intent(plan.intent_id)
+        if plan.state!="SUBMITTED": raise gl.vm.UserError("EXPECTED: plan not abandonable")
+        if gl.message.sender_address!=plan.proposer: raise gl.vm.UserError("EXPECTED: proposer only")
+        if plan.parent_plan!=intent.active_plan or int(plan.version)!=int(intent.reserved_version)+1: plan.state="STALE"
+        else: plan.state="ABANDONED"
+        self.plans[pid]=plan
 
     @gl.public.write
     def compile_intent(self,plan_id:str)->None:
         pid=self._id(plan_id); plan=self._plan(pid); intent=self._intent(plan.intent_id)
         if plan.state!="SUBMITTED": raise gl.vm.UserError("EXPECTED: plan not submitted")
+        if plan.parent_plan!=intent.active_plan or int(plan.version)!=int(intent.reserved_version)+1:
+            plan.state="STALE"; self.plans[pid]=plan; return
         report=self._compile_consensus(pid,plan,intent); canonical=json.dumps(report,sort_keys=True,separators=(",",":")); plan.report_json=canonical; plan.fingerprint=hashlib.sha256(canonical.encode()).hexdigest(); plan.state=report["compilation_state"]; self.plans[pid]=plan
         intent.state=plan.state
         if plan.state=="COMPILED":
+            slot=plan.intent_id+":"+str(int(plan.version))
+            if self.latest_attempt.get(slot,"")!=pid: raise gl.vm.UserError("EXPECTED: superseded attempt")
+            if self.version_finalized.get(slot,False): raise gl.vm.UserError("EXPECTED: version finalized")
             if plan.parent_plan!=intent.active_plan: raise gl.vm.UserError("EXPECTED: activation head changed")
             if len(intent.active_plan)>0:
                 old=self.plans[intent.active_plan]; old.state="SUPERSEDED"; self.plans[intent.active_plan]=old
             intent.active_plan=pid
+            intent.reserved_version=plan.version; self.version_finalized[slot]=True
         self.intents[plan.intent_id]=intent
 
     @gl.public.view
     def get_intent(self,intent_id:str)->Intent: return self._intent(self._id(intent_id))
     @gl.public.view
     def get_plan(self,plan_id:str)->Plan: return self._plan(self._id(plan_id))
+    @gl.public.view
+    def get_latest_attempt(self,intent_id:str,version:u64)->Plan:
+        iid=self._id(intent_id); self._intent(iid); pid=self.latest_attempt.get(iid+":"+str(int(version)),"")
+        if len(pid)==0: raise gl.vm.UserError("EXPECTED: no plan attempt")
+        return self.plans[pid]
     @gl.public.view
     def verify_execution_ready(self,intent_id:str,plan_id:str,fingerprint:str)->bool:
         intent=self._intent(self._id(intent_id)); pid=self._id(plan_id)
@@ -110,7 +144,7 @@ class AgentIntentCompiler(gl.Contract):
                 semantic={"goal":self._enum(raw,"goal",("COMPLETE","PARTIAL","MISSING","UNKNOWN")),"constraints":self._enum(raw,"constraints",("PRESERVED","VIOLATED","UNKNOWN")),"forbidden":self._enum(raw,"forbidden",("CLEAR","VIOLATED","UNKNOWN")),"assumptions":self._enum(raw,"assumptions",("EXPLICIT","HIDDEN_CRITICAL","UNKNOWN")),"rollback":self._enum(raw,"rollback",("ADEQUATE","MISSING","NOT_APPLICABLE","UNKNOWN")),"risk":self._enum(raw,"risk",("LOW","MEDIUM","HIGH","UNKNOWN"))}
             ready=semantic["goal"]=="COMPLETE" and semantic["constraints"]=="PRESERVED" and semantic["forbidden"]=="CLEAR" and semantic["assumptions"]=="EXPLICIT" and semantic["rollback"] in ("ADEQUATE","NOT_APPLICABLE") and semantic["risk"] in ("LOW","MEDIUM") and graph["graph_state"]=="VALID"
             unavailable=source_intent["status"]!="OK" or source_plan["status"]!="OK"
-            record={"policy":POLICY,"intent_id":plan.intent_id,"plan_id":pid,"version":int(plan.version),"parent_plan":plan.parent_plan,"source_count":2,"source_statuses":[source_intent["status"],source_plan["status"]],"http_statuses":[source_intent["http"],source_plan["http"]],"source_fingerprints":[source_intent["fingerprint"],source_plan["fingerprint"]],"hash_matches":[intent_match,plan_match],"step_count":graph["step_count"],"edge_count":graph["edge_count"],"root_count":graph["root_count"],"graph_state":graph["graph_state"],"goal_coverage":semantic["goal"],"constraint_preservation":semantic["constraints"],"forbidden_actions":semantic["forbidden"],"assumptions":semantic["assumptions"],"rollback":semantic["rollback"],"risk":semantic["risk"],"compilation_state":"UNAVAILABLE" if unavailable else ("COMPILED" if ready and intent_match and plan_match else "REQUIRES_REVISION")}
+            record={"policy":POLICY,"intent_id":plan.intent_id,"plan_id":pid,"version":int(plan.version),"parent_plan":plan.parent_plan,"replacement_of":plan.replacement_of,"attempt":int(plan.attempt),"source_count":2,"source_statuses":[source_intent["status"],source_plan["status"]],"http_statuses":[source_intent["http"],source_plan["http"]],"source_fingerprints":[source_intent["fingerprint"],source_plan["fingerprint"]],"hash_matches":[intent_match,plan_match],"step_count":graph["step_count"],"edge_count":graph["edge_count"],"root_count":graph["root_count"],"graph_state":graph["graph_state"],"goal_coverage":semantic["goal"],"constraint_preservation":semantic["constraints"],"forbidden_actions":semantic["forbidden"],"assumptions":semantic["assumptions"],"rollback":semantic["rollback"],"risk":semantic["risk"],"compilation_state":"UNAVAILABLE" if unavailable else ("COMPILED" if ready and intent_match and plan_match else "REQUIRES_REVISION")}
             record["record_fingerprint"]=hashlib.sha256(json.dumps(record,sort_keys=True,separators=(",",":")).encode()).hexdigest(); return record
         def validate(leaders_res):
             if not isinstance(leaders_res,gl.vm.Return): return False
@@ -141,7 +175,7 @@ class AgentIntentCompiler(gl.Contract):
                 if incoming[nxt]==0: queue.append(nxt)
         return {"step_count":len(steps),"edge_count":len(edges),"root_count":roots,"graph_state":"VALID" if visited==len(ids) and roots>0 else "INVALID"}
 
-    def _valid(self,r,pid,plan): return isinstance(r,dict) and r.get("plan_id")==pid and r.get("intent_id")==plan.intent_id and int(r.get("version",0))==int(plan.version) and int(r.get("source_count",-1))==2 and isinstance(r.get("source_statuses"),list) and len(r["source_statuses"])==2 and isinstance(r.get("hash_matches"),list) and len(r["hash_matches"])==2 and r.get("compilation_state") in ("COMPILED","REQUIRES_REVISION","UNAVAILABLE") and len(str(r.get("record_fingerprint","")))==64
+    def _valid(self,r,pid,plan): return isinstance(r,dict) and r.get("plan_id")==pid and r.get("intent_id")==plan.intent_id and int(r.get("version",0))==int(plan.version) and r.get("replacement_of")==plan.replacement_of and int(r.get("attempt",0))==int(plan.attempt) and int(r.get("source_count",-1))==2 and isinstance(r.get("source_statuses"),list) and len(r["source_statuses"])==2 and isinstance(r.get("hash_matches"),list) and len(r["hash_matches"])==2 and r.get("compilation_state") in ("COMPILED","REQUIRES_REVISION","UNAVAILABLE") and len(str(r.get("record_fingerprint","")))==64
     def _fetch(self,url):
         try:
             response=gl.nondet.web.get(url); status=int(getattr(response,"status_code",getattr(response,"status",0))); body=response.body.decode("utf-8",errors="ignore")[:MAX_BODY]; ok=200<=status<300 and len(body)>0

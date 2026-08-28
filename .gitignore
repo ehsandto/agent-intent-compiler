@@ -4,3 +4,6 @@ __pycache__/
 .env
 deployment.json
 proofs.json
+recovery-proofs.json
+.recovery-owner-key
+.recovery-planner-key
